@@ -8,6 +8,9 @@ const crypto = require("crypto");
 const QRCode = require("qrcode");
 const session = require("express-session");
 const nodemailer = require("nodemailer");
+const dotenv = require("dotenv").config();
+
+
 
 const app = express();
 
@@ -19,12 +22,11 @@ const UPLOAD_DIR = path.join(__dirname, "uploads");
 const DB_PATH = path.join(__dirname, "db.json");
 const AUDIT_LOG_PATH = path.join(__dirname, "audit.log");
 
-const ADMIN_USER = process.env.ADMIN_USER || "admin";
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "admin@example.com";
-const ADMIN_PASS = process.env.ADMIN_PASS || "password123";
+const ADMIN_USER = process.env.ADMIN_USER;
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
+const ADMIN_PASS = process.env.ADMIN_PASS;
 
-const SESSION_SECRET =
-  process.env.SESSION_SECRET || "change-this-session-secret";
+const SESSION_SECRET = process.env.SESSION_SECRET || "change-this-session-secret";
 
 // Set COOKIE_SECURE=true when running behind HTTPS in production.
 const COOKIE_SECURE = process.env.COOKIE_SECURE === "true";
@@ -34,10 +36,7 @@ const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || 50);
 const MAX_TITLE_LEN = 200;
 const MAX_CATEGORY_LEN = 100;
 
-// ---------------------------------------------------------------------
-// Allow-list of accepted upload types. Anything not listed here is
-// rejected at upload time. Add to this list deliberately.
-// ---------------------------------------------------------------------
+// Allow-list of accepted upload types.
 const ALLOWED_MIME_TO_EXT = {
   "application/pdf": [".pdf"],
   "image/png": [".png"],
@@ -58,11 +57,8 @@ const ALLOWED_MIME_TO_EXT = {
   "application/zip": [".zip"]
 };
 
-const ALL_ALLOWED_EXT = new Set(
-  Object.values(ALLOWED_MIME_TO_EXT).flat()
-);
+const ALL_ALLOWED_EXT = new Set(Object.values(ALLOWED_MIME_TO_EXT).flat());
 
-// File types that get an inline preview on the admin detail page.
 const PREVIEWABLE_IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
 const PREVIEWABLE_TEXT_EXT = new Set([".txt", ".csv", ".json"]);
 const PREVIEWABLE_PDF_EXT = new Set([".pdf"]);
@@ -91,11 +87,6 @@ app.use(
   })
 );
 
-// ---------------------------------------------------------------------
-// Audit log: append-only line-delimited JSON. Captures who/what/when for
-// every admin-sensitive action. Kept separate from db.json so it can't be
-// trivially rewritten by anything that only touches application data.
-// ---------------------------------------------------------------------
 function auditLog(req, action, details = {}) {
   const entry = {
     time: new Date().toISOString(),
@@ -112,13 +103,8 @@ function auditLog(req, action, details = {}) {
   }
 }
 
-// ---------------------------------------------------------------------
-// Minimal in-memory rate limiter. Good enough for a single-instance admin
-// tool; tracks attempts per IP within a sliding window. Not shared across
-// processes/restarts by design (kept dependency-free and simple).
-// ---------------------------------------------------------------------
 function makeRateLimiter({ windowMs, max }) {
-  const hits = new Map(); // ip -> [timestamps]
+  const hits = new Map();
 
   return function rateLimiter(req, res, next) {
     const now = Date.now();
@@ -140,20 +126,11 @@ const loginLimiter = makeRateLimiter({ windowMs: 15 * 60 * 1000, max: 10 });
 const resetLimiter = makeRateLimiter({ windowMs: 15 * 60 * 1000, max: 5 });
 const uploadLimiter = makeRateLimiter({ windowMs: 60 * 1000, max: 20 });
 
-// ---------------------------------------------------------------------
-// CSRF protection (double-submit cookie pattern). Avoids depending on the
-// unmaintained `csurf` package. A random token is set as a non-HttpOnly
-// cookie; every state-changing form includes the same token as a hidden
-// field. We reject the request unless they match. This protects against
-// cross-site form submission since an attacker's page can't read the
-// cookie value to put it in their forged form.
-// ---------------------------------------------------------------------
 const CSRF_COOKIE_NAME = "csrfToken";
 
 function parseCookies(req) {
   const header = req.headers.cookie;
   const out = {};
-
   if (!header) return out;
 
   for (const part of header.split(";")) {
@@ -163,7 +140,6 @@ function parseCookies(req) {
     const val = part.slice(idx + 1).trim();
     out[key] = decodeURIComponent(val);
   }
-
   return out;
 }
 
@@ -183,7 +159,6 @@ function ensureCsrfCookie(req, res) {
   return token;
 }
 
-// Applied to GET routes that render forms, so a token always exists.
 app.use(function (req, res, next) {
   ensureCsrfCookie(req, res);
   next();
@@ -237,9 +212,6 @@ const DEFAULT_DB = () => ({
   reset: null
 });
 
-// Creates db.json if missing, AND backfills any missing top-level fields
-// on an existing file so a stale/partial db.json self-heals instead of
-// crashing the app.
 function initDb() {
   if (!fs.existsSync(DB_PATH)) {
     fs.writeFileSync(DB_PATH, JSON.stringify(DEFAULT_DB(), null, 2));
@@ -247,7 +219,6 @@ function initDb() {
   }
 
   let db;
-
   try {
     db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
   } catch (err) {
@@ -259,25 +230,10 @@ function initDb() {
   const defaults = DEFAULT_DB();
   let changed = false;
 
-  if (!db.admin) {
-    db.admin = defaults.admin;
-    changed = true;
-  }
-
-  if (!Array.isArray(db.categories)) {
-    db.categories = [];
-    changed = true;
-  }
-
-  if (!Array.isArray(db.files)) {
-    db.files = [];
-    changed = true;
-  }
-
-  if (!("reset" in db)) {
-    db.reset = null;
-    changed = true;
-  }
+  if (!db.admin) { db.admin = defaults.admin; changed = true; }
+  if (!Array.isArray(db.categories)) { db.categories = []; changed = true; }
+  if (!Array.isArray(db.files)) { db.files = []; changed = true; }
+  if (!("reset" in db)) { db.reset = null; changed = true; }
 
   if (changed) {
     fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
@@ -306,7 +262,7 @@ function safeFilename(value) {
 }
 
 function escapeHtml(value) {
-  return String(value)
+  return String(value || "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
@@ -323,15 +279,9 @@ function findFile(db, id) {
 }
 
 function isValidEmail(value) {
-  // Intentionally simple; full RFC validation isn't needed for an admin
-  // single-account email field, just a basic sanity check.
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 }
 
-// Validates that an uploaded file's mimetype and extension both appear on
-// the allow-list, and that they're consistent with each other (e.g. a
-// renamed .exe sent as image/png is still rejected because the extension
-// check fails the allow-list pairing).
 function validateUploadType(originalname, mimetype) {
   const ext = path.extname(originalname).toLowerCase();
 
@@ -340,7 +290,6 @@ function validateUploadType(originalname, mimetype) {
   }
 
   const allowedExtsForMime = ALLOWED_MIME_TO_EXT[mimetype];
-
   if (!allowedExtsForMime || !allowedExtsForMime.includes(ext)) {
     return {
       ok: false,
@@ -361,10 +310,7 @@ function previewKind(ext) {
 }
 
 async function sendOtpEmail(to, otp) {
-  const hasSmtp =
-    process.env.SMTP_HOST &&
-    process.env.SMTP_USER &&
-    process.env.SMTP_PASS;
+  const hasSmtp = process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS;
 
   if (!hasSmtp) {
     console.log("====================================");
@@ -392,26 +338,17 @@ async function sendOtpEmail(to, otp) {
   });
 }
 
-// A single multer instance whose storage engine decides the destination
-// filename at write-time based on the form's "action"/"id" fields, which
-// multer makes available on req.body by the time filename() is called
-// (as long as those fields appear before the file field in the form,
-// which they do in the HTML below). File type is checked again in
-// fileFilter, before anything is written to disk.
 const dynamicStorage = multer.diskStorage({
   destination: function (req, file, cb) {
     cb(null, UPLOAD_DIR);
   },
-
   filename: function (req, file, cb) {
     if (req.body.action === "replace") {
       const db = readDb();
       const existing = findFile(db, req.body.id);
-
       if (!existing) {
         return cb(new Error("File not found for replace."));
       }
-
       return cb(null, existing.storedName);
     }
 
@@ -432,11 +369,9 @@ const dynamicUpload = multer({
   },
   fileFilter: function (req, file, cb) {
     const result = validateUploadType(file.originalname, file.mimetype);
-
     if (!result.ok) {
       return cb(new Error(result.reason));
     }
-
     cb(null, true);
   }
 }).single("file");
@@ -447,18 +382,244 @@ function page(title, body, extraHead = "") {
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${escapeHtml(title)}</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; color: #222; }
-    input, button { font-size: 1rem; padding: 0.4rem; }
-    button { cursor: pointer; }
-    .error { color: #b00020; }
-    .notice { color: #1a5d1a; }
-    .preview img, .preview video { max-width: 100%; height: auto; }
-    .preview iframe { width: 100%; height: 600px; border: 1px solid #ccc; }
-    .preview pre { background: #f5f5f5; padding: 1rem; overflow: auto; max-height: 400px; white-space: pre-wrap; word-break: break-word; }
+    :root {
+      --bg: #f4f5f7;
+      --surface: #ffffff;
+      --border: #e1e4e8;
+      --text: #1f2328;
+      --muted: #6a7280;
+      --accent: #2563eb;
+      --accent-dark: #1d4ed8;
+      --danger: #b00020;
+      --danger-dark: #8e001a;
+      --notice: #1a5d1a;
+      --radius: 10px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      max-width: 1000px;
+      margin: 0 auto;
+      padding: 0 1rem 3rem;
+      color: var(--text);
+      background: var(--bg);
+    }
+
+    h1, h2 { margin: 0; }
+
+    input, button, select {
+      font-size: 1rem;
+      padding: 0.5rem 0.7rem;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-family: inherit;
+    }
+
+    input:focus, button:focus, select:focus {
+      outline: 2px solid var(--accent);
+      outline-offset: 1px;
+    }
+
+    button {
+      cursor: pointer;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      font-weight: 600;
+    }
+
+    button:hover { background: var(--accent-dark); }
+
+    button[type="button"] {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+      font-weight: 500;
+    }
+
+    button[type="button"]:hover { background: #f0f1f3; }
+
+    .error { color: var(--danger); }
+    .notice { color: var(--notice); }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1.25rem 0;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+    }
+
+    .topbar h1 { font-size: 1.4rem; }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem 1.5rem;
+      margin-bottom: 1.25rem;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    }
+
+    .panel > legend, fieldset.panel > legend {
+      font-weight: 700;
+      font-size: 1.05rem;
+      padding: 0 0.3rem;
+    }
+
+    fieldset.panel { border: 1px solid var(--border); }
+
+    .form-grid {
+      display: grid;
+      gap: 0.85rem;
+      margin-top: 0.75rem;
+    }
+
+    .form-grid label {
+      display: block;
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: var(--muted);
+      margin-bottom: 0.3rem;
+    }
+
+    .form-grid input, .form-grid select {
+      width: 100%;
+    }
+
     .field-row { display: flex; align-items: center; gap: 0.5rem; }
-    .danger { background: #b00020; color: white; border: none; }
+
+    .danger { background: var(--danger); }
+    .danger:hover { background: var(--danger-dark); }
+
+    .search-bar {
+      position: sticky;
+      top: 0;
+      background: var(--bg);
+      padding: 0.75rem 0;
+      z-index: 5;
+      display: flex;
+      gap: 0.6rem;
+      align-items: center;
+    }
+
+    .search-bar input {
+      flex: 1;
+      padding: 0.6rem 0.9rem;
+      border-radius: 8px;
+      font-size: 1rem;
+    }
+
+    .search-count {
+      color: var(--muted);
+      font-size: 0.9rem;
+      white-space: nowrap;
+    }
+
+    .file-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+
+    .file-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem 1.1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    }
+
+    .file-card .file-title {
+      font-weight: 700;
+      font-size: 1.05rem;
+      word-break: break-word;
+    }
+
+    .file-card .file-meta {
+      font-size: 0.85rem;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .file-card .file-meta strong { color: var(--text); }
+
+    .badge {
+      display: inline-block;
+      background: #e8eefc;
+      color: var(--accent-dark);
+      border-radius: 999px;
+      padding: 0.15rem 0.6rem;
+      font-size: 0.75rem;
+      font-weight: 600;
+      width: fit-content;
+    }
+
+    .file-card .file-link {
+      font-size: 0.85rem;
+      word-break: break-all;
+    }
+
+    .file-card .qr-row {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-top: 0.2rem;
+    }
+
+    .file-card .qr-row img {
+      width: 64px;
+      height: 64px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+
+    .file-card .file-actions {
+      margin-top: auto;
+      padding-top: 0.5rem;
+    }
+
+    .file-card .file-actions a {
+      display: inline-block;
+      font-weight: 600;
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    .file-card .file-actions a:hover { text-decoration: underline; }
+
+    .empty-state {
+      text-align: center;
+      color: var(--muted);
+      padding: 2.5rem 1rem;
+    }
+
+    .preview img, .preview video { max-width: 100%; height: auto; border-radius: 8px; }
+    .preview iframe { width: 100%; height: 600px; border: 1px solid var(--border); border-radius: 8px; }
+    .preview pre { background: #f5f5f5; padding: 1rem; overflow: auto; max-height: 400px; white-space: pre-wrap; word-break: break-word; border-radius: 8px; }
+
+    .detail-meta {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem 1.25rem;
+      font-size: 0.9rem;
+      line-height: 1.6;
+    }
+
+    .back-link { display: inline-block; margin-bottom: 1rem; color: var(--accent); text-decoration: none; font-weight: 600; }
+    .back-link:hover { text-decoration: underline; }
+
     fieldset { margin-bottom: 1.5rem; }
   </style>
   ${extraHead}
@@ -472,7 +633,6 @@ function page(title, body, extraHead = "") {
 
 function passwordFieldWithToggle(name, idSuffix) {
   const inputId = `pw_${idSuffix}`;
-
   return `
     <span class="field-row">
       <input id="${inputId}" name="${name}" type="password" autocomplete="off">
@@ -490,28 +650,15 @@ function renderLoginPage(req, message = "", isError = true) {
     "Admin Login",
     `
     <h1>Admin Login</h1>
-
     ${message ? `<p class="${isError ? "error" : "notice"}">${escapeHtml(message)}</p>` : ""}
-
     <form method="POST" action="/admin">
       ${csrfField(req)}
       <input type="hidden" name="action" value="login">
-
-      <p>
-        Username:
-        <input name="username" autocomplete="username" required>
-      </p>
-
-      <p>
-        Password:
-        ${passwordFieldWithToggle("password", "login")}
-      </p>
-
+      <p>Username: <input name="username" autocomplete="username" required></p>
+      <p>Password: ${passwordFieldWithToggle("password", "login")}</p>
       <button type="submit">Login</button>
     </form>
-
     <hr>
-
     <form method="POST" action="/admin">
       ${csrfField(req)}
       <input type="hidden" name="action" value="show_forgot">
@@ -526,23 +673,14 @@ function renderForgotPage(req, message = "") {
     "Forgot Password",
     `
     <h1>Reset Admin Password</h1>
-
     ${message ? `<p>${escapeHtml(message)}</p>` : ""}
-
     <form method="POST" action="/admin">
       ${csrfField(req)}
       <input type="hidden" name="action" value="request_reset">
-
-      <p>
-        Admin email:
-        <input name="email" type="email" required>
-      </p>
-
+      <p>Admin email: <input name="email" type="email" required></p>
       <button type="submit">Send OTP</button>
     </form>
-
     <hr>
-
     <form method="GET" action="/admin">
       <button type="submit">Back to login</button>
     </form>
@@ -555,34 +693,16 @@ function renderResetPage(req, message = "", email = "") {
     "Enter OTP",
     `
     <h1>Enter OTP</h1>
-
     ${message ? `<p>${escapeHtml(message)}</p>` : ""}
-
     <form method="POST" action="/admin">
       ${csrfField(req)}
       <input type="hidden" name="action" value="reset_password">
-
-      <p>
-        Admin email:
-        <input name="email" type="email" value="${escapeHtml(email)}" required>
-      </p>
-
-      <p>
-        OTP:
-        <input name="otp" required>
-      </p>
-
-      <p>
-        New password:
-        ${passwordFieldWithToggle("newPassword", "reset")}
-        <br><small>At least 8 characters.</small>
-      </p>
-
+      <p>Admin email: <input name="email" type="email" value="${escapeHtml(email)}" required></p>
+      <p>OTP: <input name="otp" required></p>
+      <p>New password: ${passwordFieldWithToggle("newPassword", "reset")}<br><small>At least 8 characters.</small></p>
       <button type="submit">Reset Password</button>
     </form>
-
     <hr>
-
     <form method="GET" action="/admin">
       <button type="submit">Back to login</button>
     </form>
@@ -590,33 +710,18 @@ function renderResetPage(req, message = "", email = "") {
   );
 }
 
-// Builds the inline preview block for the file detail page based on its
-// extension. Falls back to a download-only message for non-previewable
-// types (e.g. .zip, .docx) rather than guessing at a renderer.
 function renderPreview(file, fileUrl) {
   const ext = path.extname(file.storedName).toLowerCase();
   const kind = previewKind(ext);
 
-  if (kind === "image") {
-    return `<div class="preview"><img src="${fileUrl}" alt="${escapeHtml(file.title)}"></div>`;
-  }
-
-  if (kind === "pdf") {
-    return `<div class="preview"><iframe src="${fileUrl}" title="${escapeHtml(file.title)}"></iframe></div>`;
-  }
-
-  if (kind === "audio") {
-    return `<div class="preview"><audio controls src="${fileUrl}"></audio></div>`;
-  }
-
-  if (kind === "video") {
-    return `<div class="preview"><video controls src="${fileUrl}"></video></div>`;
-  }
+  if (kind === "image") return `<div class="preview"><img src="${fileUrl}" alt="${escapeHtml(file.title)}"></div>`;
+  if (kind === "pdf") return `<div class="preview"><iframe src="${fileUrl}" title="${escapeHtml(file.title)}"></iframe></div>`;
+  if (kind === "audio") return `<div class="preview"><audio controls src="${fileUrl}"></audio></div>`;
+  if (kind === "video") return `<div class="preview"><video controls src="${fileUrl}"></video></div>`;
 
   if (kind === "text") {
     let snippet = "";
     let truncated = false;
-
     try {
       const filePath = path.resolve(UPLOAD_DIR, file.storedName);
       const stat = fs.statSync(filePath);
@@ -630,7 +735,6 @@ function renderPreview(file, fileUrl) {
     } catch (err) {
       return `<div class="preview"><p class="error">Preview unavailable: ${escapeHtml(err.message)}</p></div>`;
     }
-
     return `
       <div class="preview">
         <pre>${escapeHtml(snippet)}${truncated ? "\n\n... (truncated, showing first 64KB)" : ""}</pre>
@@ -641,84 +745,72 @@ function renderPreview(file, fileUrl) {
   return `<div class="preview"><p>No inline preview available for this file type. Use the direct URL to download/open it.</p></div>`;
 }
 
-// Standalone page for viewing/editing a single file's details.
 function renderFileDetailPage(req, file, host, message = "", isError = false) {
   const fileUrl = `${host}/files/${encodeURIComponent(file.storedName)}`;
 
   return page(
     `File: ${file.title}`,
     `
-    <h1>File Details</h1>
-
+    <div class="topbar"><h1>File Details</h1></div>
     ${message ? `<p class="${isError ? "error" : "notice"}">${escapeHtml(message)}</p>` : ""}
+    <a class="back-link" href="/admin">&laquo; Back to all files</a>
 
-    <p><a href="/admin">&laquo; Back to all files</a></p>
+    <div class="detail-meta">
+      <strong>Original name:</strong> ${escapeHtml(file.originalName)}<br>
+      <strong>Stored name:</strong> ${escapeHtml(file.storedName)}<br>
+      <strong>Type:</strong> ${escapeHtml(file.mimeType || "unknown")}<br>
+      <strong>Size:</strong> ${file.sizeBytes} bytes<br>
+      <strong>Uploaded:</strong> ${escapeHtml(file.createdAt || "")}<br>
+      ${file.updatedAt ? `<strong>Last updated:</strong> ${escapeHtml(file.updatedAt)}<br>` : ""}
+      <strong>Direct URL:</strong> <a href="${fileUrl}" target="_blank">${fileUrl}</a>
+    </div>
 
-    <hr>
-
-    <p>
-      Original name: ${escapeHtml(file.originalName)}<br>
-      Stored name: ${escapeHtml(file.storedName)}<br>
-      Type: ${escapeHtml(file.mimeType || "unknown")}<br>
-      Size: ${file.sizeBytes} bytes<br>
-      Uploaded: ${escapeHtml(file.createdAt || "")}<br>
-      ${file.updatedAt ? `Last updated: ${escapeHtml(file.updatedAt)}<br>` : ""}
-      Direct URL: <a href="${fileUrl}" target="_blank">${fileUrl}</a>
-    </p>
-
-    <h2>Preview</h2>
+    <h2 style="margin: 1.5rem 0 0.5rem;">Preview</h2>
     ${renderPreview(file, fileUrl)}
 
-    <hr>
-
-    <fieldset>
+    <fieldset class="panel" style="margin-top:1.5rem;">
       <legend>Edit Details</legend>
-
       <form method="POST" action="/admin">
         ${csrfField(req)}
         <input type="hidden" name="action" value="edit">
         <input type="hidden" name="id" value="${escapeHtml(file.id)}">
-
-        <p>
-          Category:
-          <input name="category" value="${escapeHtml(file.category)}" maxlength="${MAX_CATEGORY_LEN}" required>
-        </p>
-
-        <p>
-          File display name:
-          <input name="title" value="${escapeHtml(file.title)}" maxlength="${MAX_TITLE_LEN}" required>
-        </p>
-
-        <button type="submit">Save Changes</button>
+        <div class="form-grid">
+          <div>
+            <label for="edit_category">Category</label>
+            <input id="edit_category" name="category" value="${escapeHtml(file.category)}" maxlength="${MAX_CATEGORY_LEN}" required>
+          </div>
+          <div>
+            <label for="edit_title">File display name</label>
+            <input id="edit_title" name="title" value="${escapeHtml(file.title)}" maxlength="${MAX_TITLE_LEN}" required>
+          </div>
+        </div>
+        <div style="margin-top:1rem;"><button type="submit">Save Changes</button></div>
       </form>
     </fieldset>
 
-    <fieldset>
+    <fieldset class="panel">
       <legend>Replace File Content</legend>
-      <p>Uploading here keeps the same stored filename and public URL above; only the file content/type/size are updated.</p>
-
+      <p class="file-meta">Uploading here keeps the same stored filename and public URL above; only the file content/type/size are updated.</p>
       <form method="POST" action="/admin" enctype="multipart/form-data">
         ${csrfField(req)}
         <input type="hidden" name="action" value="replace">
         <input type="hidden" name="id" value="${escapeHtml(file.id)}">
-
-        <p>
-          New file:
-          <input type="file" name="file" required>
-        </p>
-
-        <button type="submit">Replace</button>
+        <div class="form-grid">
+          <div>
+            <label for="replace_file">New file</label>
+            <input id="replace_file" type="file" name="file" required>
+          </div>
+        </div>
+        <div style="margin-top:1rem;"><button type="submit">Replace</button></div>
       </form>
     </fieldset>
 
-    <fieldset>
+    <fieldset class="panel">
       <legend>Delete File</legend>
-
       <form method="POST" action="/admin" onsubmit="return confirm('Delete this file permanently? This cannot be undone.');">
         ${csrfField(req)}
         <input type="hidden" name="action" value="delete">
         <input type="hidden" name="id" value="${escapeHtml(file.id)}">
-
         <button type="submit" class="danger">Delete</button>
       </form>
     </fieldset>
@@ -734,6 +826,19 @@ async function renderAdminPage(req, message = "", result = null, isError = false
     .map(cat => `<option value="${escapeHtml(cat)}"></option>`)
     .join("");
 
+  const categoryCounts = {};
+  for (const file of db.files) {
+    const category = file.category || "Uncategorized";
+    categoryCounts[category] = (categoryCounts[category] || 0) + 1;
+  }
+
+  const categoryFilterOptions = Object.entries(categoryCounts)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([category, count]) => {
+      return `<option value="${escapeHtml(category.toLowerCase())}">${escapeHtml(category)} (${count})</option>`;
+    })
+    .join("");
+
   let filesHtml = "";
 
   for (const file of db.files.slice().reverse()) {
@@ -741,93 +846,142 @@ async function renderAdminPage(req, message = "", result = null, isError = false
     const qrDataUrl = await QRCode.toDataURL(fileUrl);
     const detailUrl = `/admin/file/${encodeURIComponent(file.id)}`;
 
+    // Fix: Properly double-escape or remove raw double quotes to safely stringify inside standard dataset elements
+    const searchKey = escapeHtml(
+      [file.title, file.category, file.originalName, file.storedName]
+        .join(" ")
+        .toLowerCase()
+    );
+    const fileCategoryLower = escapeHtml((file.category || "").toLowerCase());
+
     filesHtml += `
-      <p>
-        <strong>${escapeHtml(file.title)}</strong><br>
-        Category: ${escapeHtml(file.category)}<br>
-        Original name: ${escapeHtml(file.originalName)}<br>
-        Stored name: ${escapeHtml(file.storedName)}<br>
-        Type: ${escapeHtml(file.mimeType || "unknown")}<br>
-        Size: ${file.sizeBytes} bytes<br>
-        Direct URL:
-        <a href="${fileUrl}" target="_blank">${fileUrl}</a><br>
-        QR:<br>
-        <img src="${qrDataUrl}" width="150"><br>
-        <a href="${detailUrl}">View / Edit / Replace / Delete</a>
-      </p>
-      <hr>
+      <div class="file-card" data-search="${searchKey}" data-category="${fileCategoryLower}">
+        <div class="file-title">${escapeHtml(file.title)}</div>
+        <span class="badge">${escapeHtml(file.category)}</span>
+        <div class="file-meta">
+          <strong>Original:</strong> ${escapeHtml(file.originalName)}<br>
+          <strong>Stored:</strong> ${escapeHtml(file.storedName)}<br>
+          <strong>Type:</strong> ${escapeHtml(file.mimeType || "unknown")}<br>
+          <strong>Size:</strong> ${file.sizeBytes} bytes
+        </div>
+        <div class="file-link"><a href="${fileUrl}" target="_blank">${fileUrl}</a></div>
+        <div class="qr-row">
+          <img src="${qrDataUrl}" alt="QR code for ${escapeHtml(file.title)}">
+          <a href="${detailUrl}" style="font-weight:600;">View / Edit / Replace / Delete</a>
+        </div>
+      </div>
     `;
   }
 
   const resultHtml = result
     ? `
-      <h2>Uploaded</h2>
-
-      <p>
-        Stored filename:<br>
-        ${escapeHtml(result.storedName)}
-      </p>
-
-      <p>
-        Direct file URL:<br>
-        <a href="${result.fileUrl}" target="_blank">${result.fileUrl}</a>
-      </p>
-
-      <p>QR / barcode:</p>
-      <img src="${result.qrDataUrl}">
-      <hr>
+      <div class="panel">
+        <h2 style="margin-bottom:0.75rem;">Uploaded</h2>
+        <div class="file-meta" style="margin-bottom:0.75rem;"><strong>Stored filename:</strong> ${escapeHtml(result.storedName)}</div>
+        <div class="file-link" style="margin-bottom:0.75rem;"><strong>Direct file URL:</strong><br><a href="${result.fileUrl}" target="_blank">${result.fileUrl}</a></div>
+        <img src="${result.qrDataUrl}">
+      </div>
     `
     : "";
 
   return page(
     "Admin Upload",
     `
-    <h1>Admin Upload</h1>
+    <div class="topbar">
+      <h1>Admin Upload</h1>
+      <form method="POST" action="/admin">
+        ${csrfField(req)}
+        <input type="hidden" name="action" value="logout">
+        <button type="submit">Logout</button>
+      </form>
+    </div>
 
     ${message ? `<p class="${isError ? "error" : "notice"}">${escapeHtml(message)}</p>` : ""}
 
-    <form method="POST" action="/admin">
-      ${csrfField(req)}
-      <input type="hidden" name="action" value="logout">
-      <button type="submit">Logout</button>
-    </form>
-
-    <hr>
-
-    <fieldset>
+    <fieldset class="panel">
       <legend>Upload File</legend>
-
       <form method="POST" action="/admin" enctype="multipart/form-data">
         ${csrfField(req)}
         <input type="hidden" name="action" value="upload">
-
-        <p>
-          Category:
-          <input name="category" list="categories" placeholder="reports" maxlength="${MAX_CATEGORY_LEN}" required>
-          <datalist id="categories">
-            ${categoryOptions}
-          </datalist>
-        </p>
-
-        <p>
-          File display name:
-          <input name="title" placeholder="q1 sales report" maxlength="${MAX_TITLE_LEN}" required>
-        </p>
-
-        <p>
-          File:
-          <input type="file" name="file" required>
-        </p>
-
-        <button type="submit">Upload</button>
+        <div class="form-grid">
+          <div>
+            <label for="upload_category">Category</label>
+            <input id="upload_category" name="category" list="categories" placeholder="reports" maxlength="${MAX_CATEGORY_LEN}" required>
+            <datalist id="categories">${categoryOptions}</datalist>
+          </div>
+          <div>
+            <label for="upload_title">File display name</label>
+            <input id="upload_title" name="title" placeholder="q1 sales report" maxlength="${MAX_TITLE_LEN}" required>
+          </div>
+          <div>
+            <label for="upload_file">File</label>
+            <input id="upload_file" type="file" name="file" required>
+          </div>
+        </div>
+        <div style="margin-top:1rem;"><button type="submit">Upload</button></div>
       </form>
     </fieldset>
 
     ${resultHtml}
 
-    <h2>Existing Files</h2>
+    <div class="topbar" style="padding-bottom:0;">
+      <h2>Existing Files</h2>
+      <span class="search-count" id="fileCount"></span>
+    </div>
 
-    ${filesHtml || "<p>No files uploaded yet.</p>"}
+    <div class="search-bar">
+      <input type="search" id="fileSearch" placeholder="Search title, filename, category..." autocomplete="off" oninput="filterFiles()">
+      <select id="categoryFilter" onchange="filterFiles()">
+        <option value="">All categories</option>
+        ${categoryFilterOptions}
+      </select>
+      <button type="button" onclick="clearFileFilters()">Clear</button>
+    </div>
+
+    <div class="file-grid" id="fileGrid">${filesHtml}</div>
+    <div class="empty-state" id="emptyState" style="display:none;">No files match your search.</div>
+    ${db.files.length === 0 ? `<div class="empty-state" id="noFilesYet">No files uploaded yet.</div>` : ""}
+
+    <script>
+      function filterFiles() {
+        const query = document.getElementById('fileSearch').value.trim().toLowerCase();
+        const selectedCat = document.getElementById('categoryFilter').value;
+        const cards = document.querySelectorAll('#fileGrid .file-card');
+        let visibleCount = 0;
+
+        cards.forEach(function (card) {
+          const haystack = card.getAttribute('data-search') || '';
+          const cardCat = card.getAttribute('data-category') || '';
+          
+          const textMatches = haystack.indexOf(query) !== -1;
+          const catMatches = !selectedCat || cardCat === selectedCat;
+          const shouldShow = textMatches && catMatches;
+
+          card.style.display = shouldShow ? '' : 'none';
+          if (shouldShow) visibleCount++;
+        });
+
+        const countEl = document.getElementById('fileCount');
+        if (countEl) {
+          countEl.textContent = (query || selectedCat)
+            ? visibleCount + ' of ' + cards.length + ' files'
+            : cards.length + ' file' + (cards.length === 1 ? '' : 's');
+        }
+
+        const emptyState = document.getElementById('emptyState');
+        if (emptyState) {
+          emptyState.style.display = (cards.length > 0 && visibleCount === 0) ? '' : 'none';
+        }
+      }
+
+      function clearFileFilters() {
+        document.getElementById('fileSearch').value = '';
+        document.getElementById('categoryFilter').value = '';
+        filterFiles();
+      }
+
+      document.addEventListener('DOMContentLoaded', filterFiles);
+    </script>
     `
   );
 }
@@ -836,11 +990,10 @@ app.get("/admin", async function (req, res) {
   if (!req.session.isAdmin) {
     return res.send(renderLoginPage(req));
   }
-
+  res.setHeader("X-Content-Type-Options", "nosniff");
   return res.send(await renderAdminPage(req));
 });
 
-// View/edit/replace/delete a single file by id.
 app.get("/admin/file/:id", function (req, res) {
   if (!req.session.isAdmin) {
     return res.send(renderLoginPage(req));
@@ -853,6 +1006,7 @@ app.get("/admin/file/:id", function (req, res) {
     return res.status(404).send(page("Not Found", "<p>File not found.</p><p><a href=\"/admin\">Back</a></p>"));
   }
 
+  res.setHeader("X-Content-Type-Options", "nosniff");
   return res.send(renderFileDetailPage(req, file, getHost(req)));
 });
 
@@ -863,7 +1017,6 @@ app.post("/admin", function (req, res, next) {
     if (!req.session.isAdmin) {
       return res.status(401).send(renderLoginPage(req, "Log in first."));
     }
-
     return uploadLimiter(req, res, () => handleMultipart(req, res));
   }
 
@@ -872,8 +1025,6 @@ app.post("/admin", function (req, res, next) {
 
 function handleMultipart(req, res) {
   dynamicUpload(req, res, async function (err) {
-    // CSRF check happens after multer parses the body, since the token
-    // travels as a regular form field even in multipart requests.
     if (!verifyCsrf(req)) {
       auditLog(req, "csrf_rejected", { path: req.path });
       return res.status(403).send(page("Forbidden", "<p>Invalid or missing security token. Please go back and try again.</p><p><a href=\"/admin\">Back</a></p>"));
@@ -902,7 +1053,6 @@ function handleMultipart(req, res) {
       file.mimeType = req.file.mimetype;
       file.sizeBytes = req.file.size;
       file.updatedAt = new Date().toISOString();
-      // storedName intentionally unchanged so the public URL/QR stays valid.
 
       writeDb(db);
       auditLog(req, "file_replace", { fileId: file.id, storedName: file.storedName });
@@ -910,7 +1060,6 @@ function handleMultipart(req, res) {
       return res.send(renderFileDetailPage(req, file, getHost(req), "File replaced successfully."));
     }
 
-    // action === "upload"
     if (!req.file) {
       return res.send(await renderAdminPage(req, "No file uploaded.", null, true));
     }
@@ -956,11 +1105,6 @@ function handleMultipart(req, res) {
 async function handleAdminFormPost(req, res) {
   const action = req.body.action;
 
-  // Actions that don't require an existing session can still be CSRF
-  // checked, since the login/forgot-password/reset forms also carry the
-  // token. show_forgot is a pure navigation action with no side effects,
-  // so it's exempted to keep "Forgot password?" working even if a token
-  // expired between page loads.
   if (action !== "show_forgot" && !verifyCsrf(req)) {
     auditLog(req, "csrf_rejected", { path: req.path, action });
     return res.status(403).send(page("Forbidden", "<p>Invalid or missing security token. Please go back and try again.</p><p><a href=\"/admin\">Back</a></p>"));
@@ -1036,13 +1180,7 @@ async function handleAdminFormPost(req, res) {
         }
       }
 
-      return res.send(
-        renderResetPage(
-          req,
-          "If that email matches the admin account, an OTP was sent.",
-          email
-        )
-      );
+      return res.send(renderResetPage(req, "If that email matches the admin account, an OTP was sent.", email));
     });
   }
 
@@ -1052,15 +1190,11 @@ async function handleAdminFormPost(req, res) {
     const newPassword = req.body.newPassword || "";
 
     if (!newPassword || newPassword.length < 8) {
-      return res.send(
-        renderResetPage(req, "New password must be at least 8 characters.", email)
-      );
+      return res.send(renderResetPage(req, "New password must be at least 8 characters.", email));
     }
 
     const reset = db.reset;
 
-    // Cap OTP attempts so a 6-digit code can't be brute-forced even
-    // within its 10-minute validity window.
     if (reset && reset.email === email) {
       reset.attempts = (reset.attempts || 0) + 1;
 
@@ -1070,7 +1204,6 @@ async function handleAdminFormPost(req, res) {
         auditLog(req, "password_reset_locked", { email });
         return res.send(renderResetPage(req, "Too many incorrect attempts. Please request a new OTP.", email));
       }
-
       writeDb(db);
     }
 
@@ -1098,7 +1231,6 @@ async function handleAdminFormPost(req, res) {
     }
 
     const file = findFile(db, req.body.id);
-
     if (!file) {
       return res.status(404).send(page("Not Found", "<p>File not found.</p><p><a href=\"/admin\">Back</a></p>"));
     }
@@ -1111,7 +1243,6 @@ async function handleAdminFormPost(req, res) {
     }
 
     const before = { title: file.title, category: file.category };
-
     file.title = newTitle;
     file.category = newCategory;
 
@@ -1132,16 +1263,11 @@ async function handleAdminFormPost(req, res) {
     }
 
     const file = findFile(db, req.body.id);
-
     if (!file) {
       return res.status(404).send(page("Not Found", "<p>File not found.</p><p><a href=\"/admin\">Back</a></p>"));
     }
 
     const filePath = path.resolve(UPLOAD_DIR, file.storedName);
-
-    // Defensive check before unlinking, mirroring the safety check used
-    // when serving files, so a corrupted storedName can never cause a
-    // delete outside the uploads directory.
     if (filePath.startsWith(path.resolve(UPLOAD_DIR)) && fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
     }
@@ -1159,11 +1285,7 @@ async function handleAdminFormPost(req, res) {
 app.get("/files/:filename", function (req, res) {
   const filename = req.params.filename;
 
-  if (
-    filename.includes("..") ||
-    filename.includes("/") ||
-    filename.includes("\\")
-  ) {
+  if (filename.includes("..") || filename.includes("/") || filename.includes("\\")) {
     return res.status(400).send("Invalid filename");
   }
 
@@ -1180,20 +1302,9 @@ app.get("/files/:filename", function (req, res) {
   res.setHeader("X-Content-Type-Options", "nosniff");
 
   const ext = path.extname(filename).toLowerCase();
-
   const inlineAllowed = new Set([
-    ".pdf",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".webp",
-    ".txt",
-    ".csv",
-    ".json",
-    ".mp4",
-    ".mp3",
-    ".wav"
+    ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp",
+    ".txt", ".csv", ".json", ".mp4", ".mp3", ".wav"
   ]);
 
   if (inlineAllowed.has(ext)) {
@@ -1203,14 +1314,11 @@ app.get("/files/:filename", function (req, res) {
   return res.download(filePath, filename);
 });
 
-
-app.get("*",(req, res) => {
+app.get("*", (req, res) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
   res.status(404).send(page("Not Found", "<p>Page not found.</p>"));
 });
 
-// Basic error handler so unexpected exceptions (e.g. multer file-size
-// limit errors thrown outside the dynamicUpload callback) return a clean
-// page instead of crashing the process or leaking a stack trace.
 app.use(function (err, req, res, next) {
   console.error("Unhandled error:", err);
   auditLog(req, "unhandled_error", { message: err.message, path: req.path });
@@ -1222,18 +1330,5 @@ app.use(function (err, req, res, next) {
 
 app.listen(PORT, function () {
   initDb();
-
   console.log(`Server running at http://localhost:${PORT}/admin`);
-  console.log(`Default admin username: ${ADMIN_USER}`);
-  console.log(`Default admin email: ${ADMIN_EMAIL}`);
-  console.log(`Default admin password: ${ADMIN_PASS}`);
-  console.log(`Max upload size: ${MAX_FILE_MB} MB`);
-
-  if (!process.env.SESSION_SECRET) {
-    console.warn("WARNING: SESSION_SECRET not set, using an insecure default. Set it via environment variable in production.");
-  }
-
-  if (!COOKIE_SECURE) {
-    console.warn("WARNING: COOKIE_SECURE is not enabled. Set COOKIE_SECURE=true when serving over HTTPS in production.");
-  }
 });
