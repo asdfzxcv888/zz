@@ -8,13 +8,18 @@ const crypto = require("crypto");
 const QRCode = require("qrcode");
 const session = require("express-session");
 const nodemailer = require("nodemailer");
+const { google } = require("googleapis");
 const dotenv = require("dotenv").config();
+
+const archiver=require("archiver");
 
 
 
 const app = express();
 
-app.set("trust proxy", true);
+// Trust only the first proxy hop (Render's load balancer).
+// "true" would trust all X-Forwarded-* headers and allow IP spoofing.
+app.set("trust proxy", 1);
 
 const PORT = process.env.PORT || 3000;
 
@@ -22,19 +27,50 @@ const UPLOAD_DIR = path.join(__dirname, "uploads");
 const DB_PATH = path.join(__dirname, "db.json");
 const AUDIT_LOG_PATH = path.join(__dirname, "audit.log");
 
+// Crash loudly on boot if critical env vars are missing rather than
+// silently creating an admin account with undefined credentials.
 const ADMIN_USER = process.env.ADMIN_USER;
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
 const ADMIN_PASS = process.env.ADMIN_PASS;
 
-const SESSION_SECRET = process.env.SESSION_SECRET || "change-this-session-secret";
+if (!ADMIN_USER || !ADMIN_EMAIL || !ADMIN_PASS) {
+  throw new Error("ADMIN_USER, ADMIN_EMAIL, and ADMIN_PASS env vars are required.");
+}
 
-// Set COOKIE_SECURE=true when running behind HTTPS in production.
-const COOKIE_SECURE = process.env.COOKIE_SECURE === "true";
+const SESSIONS_PATH = path.join(__dirname, "sessions.json");
+
+const SESSION_SECRET = process.env.SESSION_SECRET;
+if (!SESSION_SECRET) throw new Error("SESSION_SECRET env var is required.");
+
+// Automatically true in production (Render sets NODE_ENV=production).
+// Never needs to be set manually.
+const COOKIE_SECURE = process.env.NODE_ENV === "production";
+
+const SESSION_MAX_AGE_MS = Number(
+  process.env.SESSION_MAX_AGE_MS || 7 * 24 * 60 * 60 * 1000
+);
 
 const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || 50);
 
 const MAX_TITLE_LEN = 200;
 const MAX_CATEGORY_LEN = 100;
+
+// ---------------------------------------------------------------------
+// Google Drive backup config. Uses an OAuth2 refresh token (drive.file
+// scope) tied to the admin's own Google account, set up once via the
+// OAuth Playground. With all three vars present, every upload/replace/
+// delete is mirrored to Drive in the background. Missing vars disable
+// the feature entirely rather than erroring, so it's safe to deploy
+// without ever configuring it.
+// ---------------------------------------------------------------------
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
+const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || null;
+
+const DRIVE_BACKUP_ENABLED = Boolean(
+  GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_REFRESH_TOKEN
+);
 
 // Allow-list of accepted upload types.
 const ALLOWED_MIME_TO_EXT = {
@@ -71,18 +107,152 @@ if (!fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
-app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+class FileSessionStore extends session.Store {
+  constructor({ filePath, ttlMs }) {
+    super();
+    this.filePath = filePath;
+    this.ttlMs = ttlMs;
 
+    if (!fs.existsSync(this.filePath)) {
+      fs.writeFileSync(this.filePath, JSON.stringify({}, null, 2));
+    }
+
+    this.cleanupTimer = setInterval(() => this.pruneExpired(), 60 * 60 * 1000);
+    this.cleanupTimer.unref?.();
+  }
+
+  readSessions() {
+    try {
+      const raw = fs.readFileSync(this.filePath, "utf8");
+      return raw ? JSON.parse(raw) : {};
+    } catch (err) {
+      console.error("sessions.json broken, resetting:", err.message);
+      return {};
+    }
+  }
+
+  writeSessions(sessions) {
+    const tmpPath = `${this.filePath}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(sessions, null, 2));
+    fs.renameSync(tmpPath, this.filePath);
+  }
+
+  getExpiry(sess) {
+    const cookieExpiry =
+      sess && sess.cookie && sess.cookie.expires
+        ? new Date(sess.cookie.expires).getTime()
+        : null;
+
+    return Number.isFinite(cookieExpiry)
+      ? cookieExpiry
+      : Date.now() + this.ttlMs;
+  }
+
+  isExpired(record) {
+    return !record || !record.expiresAt || Date.now() > record.expiresAt;
+  }
+
+  get(sid, callback) {
+    try {
+      const sessions = this.readSessions();
+      const record = sessions[sid];
+
+      if (!record) return callback(null, null);
+
+      if (this.isExpired(record)) {
+        delete sessions[sid];
+        this.writeSessions(sessions);
+        return callback(null, null);
+      }
+
+      return callback(null, record.session);
+    } catch (err) {
+      return callback(err);
+    }
+  }
+
+  set(sid, sess, callback) {
+    try {
+      const sessions = this.readSessions();
+
+      sessions[sid] = {
+        expiresAt: this.getExpiry(sess),
+        session: sess
+      };
+
+      this.writeSessions(sessions);
+      return callback && callback(null);
+    } catch (err) {
+      return callback && callback(err);
+    }
+  }
+
+  touch(sid, sess, callback) {
+    try {
+      const sessions = this.readSessions();
+
+      if (sessions[sid]) {
+        sessions[sid].expiresAt = this.getExpiry(sess);
+        sessions[sid].session.cookie = sess.cookie;
+        this.writeSessions(sessions);
+      }
+
+      return callback && callback(null);
+    } catch (err) {
+      return callback && callback(err);
+    }
+  }
+
+  destroy(sid, callback) {
+    try {
+      const sessions = this.readSessions();
+      delete sessions[sid];
+      this.writeSessions(sessions);
+      return callback && callback(null);
+    } catch (err) {
+      return callback && callback(err);
+    }
+  }
+
+  pruneExpired() {
+    try {
+      const sessions = this.readSessions();
+      let changed = false;
+
+      for (const [sid, record] of Object.entries(sessions)) {
+        if (this.isExpired(record)) {
+          delete sessions[sid];
+          changed = true;
+        }
+      }
+
+      if (changed) this.writeSessions(sessions);
+    } catch (err) {
+      console.error("Session cleanup failed:", err.message);
+    }
+  }
+}
+
+const sessionStore = new FileSessionStore({
+  filePath: SESSIONS_PATH,
+  ttlMs: SESSION_MAX_AGE_MS
+});
+
+app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 app.use(
   session({
+    name: "admin.sid",
+    store: sessionStore,
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
+    rolling: true,
+    unset: "destroy",
     cookie: {
       httpOnly: true,
       sameSite: "lax",
       secure: COOKIE_SECURE,
-      maxAge: 12 * 60 * 60 * 1000 // 12 hours
+      maxAge: SESSION_MAX_AGE_MS
     }
   })
 );
@@ -338,6 +508,195 @@ async function sendOtpEmail(to, otp) {
   });
 }
 
+// ---------------------------------------------------------------------
+// Google Drive integration.
+//
+// Strategy (Render-safe ephemeral filesystem):
+//   BOOT  → restore db.json + all upload files FROM Drive to local disk.
+//   UPLOAD/REPLACE → push the new file + updated db.json TO Drive.
+//   DELETE → delete the file from Drive, push updated db.json TO Drive.
+//   Nothing else triggers a Drive write.
+//
+// Uses drive.file scope — this app can only see files it created itself.
+// googleapis refreshes the short-lived access token automatically from
+// the long-lived refresh token.
+// Missing env vars disable the feature entirely (safe to deploy without).
+// ---------------------------------------------------------------------
+let driveClientInstance = null;
+
+function getDriveClient() {
+  if (!DRIVE_BACKUP_ENABLED) return null;
+
+  if (!driveClientInstance) {
+    const oauth2Client = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
+    oauth2Client.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
+    driveClientInstance = google.drive({ version: "v3", auth: oauth2Client });
+  }
+
+  return driveClientInstance;
+}
+
+async function findDriveFileByName(drive, name) {
+  const parentClause = GOOGLE_DRIVE_FOLDER_ID
+    ? ` and '${GOOGLE_DRIVE_FOLDER_ID}' in parents`
+    : "";
+
+  const escapedName = name.replace(/'/g, "\\'");
+
+  const res = await drive.files.list({
+    q: `name = '${escapedName}' and trashed = false${parentClause}`,
+    fields: "files(id, name, mimeType)",
+    spaces: "drive",
+    pageSize: 1
+  });
+
+  return res.data.files && res.data.files[0] ? res.data.files[0] : null;
+}
+
+// Upload or overwrite a single local file in Drive.
+async function pushFileToDrive(localPath, driveName, mimeType) {
+  const drive = getDriveClient();
+  if (!drive) return null;
+
+  const media = {
+    mimeType: mimeType || "application/octet-stream",
+    body: fs.createReadStream(localPath)
+  };
+
+  const existing = await findDriveFileByName(drive, driveName);
+
+  if (existing) {
+    const res = await drive.files.update({ fileId: existing.id, media, fields: "id" });
+    return res.data.id;
+  }
+
+  const fileMetadata = {
+    name: driveName,
+    ...(GOOGLE_DRIVE_FOLDER_ID ? { parents: [GOOGLE_DRIVE_FOLDER_ID] } : {})
+  };
+
+  const res = await drive.files.create({ requestBody: fileMetadata, media, fields: "id" });
+  return res.data.id;
+}
+
+// Download a Drive file by name to a local path.
+async function pullFileFromDrive(drive, driveName, localPath) {
+  const found = await findDriveFileByName(drive, driveName);
+  if (!found) return false;
+
+  const destStream = fs.createWriteStream(localPath);
+
+  await new Promise((resolve, reject) => {
+    drive.files.get(
+      { fileId: found.id, alt: "media" },
+      { responseType: "stream" },
+      function (err, driveRes) {
+        if (err) return reject(err);
+        driveRes.data
+          .on("error", reject)
+          .pipe(destStream)
+          .on("error", reject)
+          .on("finish", resolve);
+      }
+    );
+  });
+
+  return true;
+}
+
+// Called once at boot: pulls db.json and every upload file listed in it
+// from Drive to local disk so the ephemeral Render filesystem is warm.
+async function restoreFromDrive() {
+  if (!DRIVE_BACKUP_ENABLED) return;
+
+  const drive = getDriveClient();
+
+  console.log("Drive restore: fetching db.json ...");
+
+  try {
+    const pulled = await pullFileFromDrive(drive, "db.json", DB_PATH);
+    if (!pulled) {
+      console.log("Drive restore: no db.json found on Drive — starting fresh.");
+      return;
+    }
+    console.log("Drive restore: db.json restored.");
+  } catch (err) {
+    console.error("Drive restore: failed to fetch db.json:", err.message);
+    return;
+  }
+
+  // Restore every upload file referenced in db.json.
+  let db;
+  try {
+    db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
+  } catch (err) {
+    console.error("Drive restore: db.json unreadable after pull:", err.message);
+    return;
+  }
+
+  const files = Array.isArray(db.files) ? db.files : [];
+  console.log(`Drive restore: restoring ${files.length} upload file(s) ...`);
+
+  for (const record of files) {
+    const localPath = path.resolve(UPLOAD_DIR, record.storedName);
+    if (fs.existsSync(localPath)) continue; // already there
+
+    try {
+      const ok = await pullFileFromDrive(drive, record.storedName, localPath);
+      if (ok) {
+        console.log(`Drive restore:   ✓ ${record.storedName}`);
+      } else {
+        console.warn(`Drive restore:   ✗ ${record.storedName} (not found on Drive)`);
+      }
+    } catch (err) {
+      console.error(`Drive restore:   ✗ ${record.storedName}: ${err.message}`);
+    }
+  }
+
+  console.log("Drive restore: complete.");
+}
+
+// Push an uploaded/replaced file + fresh db.json to Drive.
+// Called only after upload or replace — not on edit/delete.
+async function pushUploadToDrive(req, label, storedName) {
+  if (!DRIVE_BACKUP_ENABLED) return;
+
+  try {
+    if (storedName) {
+      const filePath = path.resolve(UPLOAD_DIR, storedName);
+      if (fs.existsSync(filePath)) {
+        await pushFileToDrive(filePath, storedName);
+      }
+    }
+
+    await pushFileToDrive(DB_PATH, "db.json", "application/json");
+    auditLog(req, "drive_push_success", { trigger: label, storedName: storedName || null });
+  } catch (err) {
+    console.error("Drive push failed:", err.message);
+    auditLog(req, "drive_push_failed", { trigger: label, storedName: storedName || null, message: err.message });
+  }
+}
+
+// Delete a file from Drive when the admin deletes it locally,
+// then push updated db.json so Drive stays in sync.
+async function deleteFromDrive(req, storedName) {
+  if (!DRIVE_BACKUP_ENABLED) return;
+
+  try {
+    const drive = getDriveClient();
+    const existing = await findDriveFileByName(drive, storedName);
+    if (existing) {
+      await drive.files.delete({ fileId: existing.id });
+    }
+    // Push updated db.json so the deleted record is gone from Drive too.
+    await pushFileToDrive(DB_PATH, "db.json", "application/json");
+    auditLog(req, "drive_delete_success", { storedName });
+  } catch (err) {
+    console.error("Drive delete failed:", err.message);
+    auditLog(req, "drive_delete_failed", { storedName, message: err.message });
+  }
+}
+
 const dynamicStorage = multer.diskStorage({
   destination: function (req, file, cb) {
     cb(null, UPLOAD_DIR);
@@ -565,13 +924,33 @@ function page(title, body, extraHead = "") {
       width: fit-content;
     }
 
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      border-radius: 999px;
+      padding: 0.3rem 0.75rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+
+    .status-badge.on { background: #e6f4ea; color: #1a5d1a; }
+    .status-badge.off { background: #f1f1f1; color: var(--muted); }
+
+    .status-badge .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
     .file-card .file-link {
       font-size: 0.85rem;
       word-break: break-all;
     }
 
     .file-card .qr-row {
-      display: flex;
+      
       align-items: center;
       gap: 0.75rem;
       margin-top: 0.2rem;
@@ -864,12 +1243,37 @@ async function renderAdminPage(req, message = "", result = null, isError = false
           <strong>Type:</strong> ${escapeHtml(file.mimeType || "unknown")}<br>
           <strong>Size:</strong> ${file.sizeBytes} bytes
         </div>
-        <div class="file-link"><a href="${fileUrl}" target="_blank">${fileUrl}</a></div>
+        <div class="file-link" ><a href="${fileUrl}" target="_blank">${fileUrl}</a></div>
         <div class="qr-row">
-          <img src="${qrDataUrl}" alt="QR code for ${escapeHtml(file.title)}">
+        <div>
+           <img
+            id="qr-${file.id}"
+            src="${qrDataUrl}"
+            alt="QR code for ${escapeHtml(file.title)}"
+            class="qr-img"
+          />
+          </div>
+
+          <div>
+          <button
+            type="button"
+            class="download-qr-btn"
+            data-qr-id="qr-${file.id}"
+            data-title="${escapeHtml(file.title)}",
+            style="background:skyblue"
+          >
+            Download QR
+          </button>
+          </div>
+
+          <div>
           <a href="${detailUrl}" style="font-weight:600;">View / Edit / Replace / Delete</a>
+          </div>
         </div>
       </div>
+      <script>
+      
+      </script>
     `;
   }
 
@@ -889,11 +1293,20 @@ async function renderAdminPage(req, message = "", result = null, isError = false
     `
     <div class="topbar">
       <h1>Admin Upload</h1>
-      <form method="POST" action="/admin">
-        ${csrfField(req)}
-        <input type="hidden" name="action" value="logout">
-        <button type="submit">Logout</button>
-      </form>
+      <div style="display:flex; align-items:center; gap:0.75rem;">
+        <span class="status-badge ${DRIVE_BACKUP_ENABLED ? "on" : "off"}" title="${DRIVE_BACKUP_ENABLED ? "Files and db.json are auto-backed up to Google Drive on every change." : "Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REFRESH_TOKEN to enable Drive backup."}">
+          <span class="dot"></span>
+          Drive backup: ${DRIVE_BACKUP_ENABLED ? "On" : "Off"}
+        </span>
+        <a href="/admin/backup.zip">
+          <button type="button" style="background:#2563EB;">Download Backup (.zip)</button>
+        </a>
+        <form method="POST" action="/admin">
+          ${csrfField(req)}
+          <input type="hidden" name="action" value="logout">
+          <button type="submit">Logout</button>
+        </form>
+      </div>
     </div>
 
     ${message ? `<p class="${isError ? "error" : "notice"}">${escapeHtml(message)}</p>` : ""}
@@ -981,6 +1394,65 @@ async function renderAdminPage(req, message = "", result = null, isError = false
       }
 
       document.addEventListener('DOMContentLoaded', filterFiles);
+      document.addEventListener("click", async (e) => {
+          const btn = e.target.closest(".download-qr-btn");
+          if (!btn) return;
+
+          const img = document.getElementById(btn.dataset.qrId);
+          const title = btn.dataset.title || "qr-code";
+
+          await downloadQrWithBorder(img, title);
+        });
+
+        async function downloadQrWithBorder(imgEl, title) {
+          const img = new Image();
+          img.src = imgEl.src;
+
+          await new Promise((resolve, reject) => {
+            img.onload = resolve;
+            img.onerror = reject;
+          });
+
+          // 1mm at browser 96dpi is ~3.78px
+          const paddingPx = 4;
+          const borderPx = 2;
+
+          const canvas = document.createElement("canvas");
+          canvas.width = img.naturalWidth + paddingPx * 2 + borderPx * 2;
+          canvas.height = img.naturalHeight + paddingPx * 2 + borderPx * 2;
+
+          const ctx = canvas.getContext("2d");
+
+          ctx.fillStyle = "white";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+          ctx.strokeStyle = "black";
+          ctx.lineWidth = borderPx;
+          ctx.strokeRect(
+            borderPx / 2,
+            borderPx / 2,
+            canvas.width - borderPx,
+            canvas.height - borderPx
+          );
+
+          ctx.drawImage(
+            img,
+            borderPx + paddingPx,
+            borderPx + paddingPx,
+            img.naturalWidth,
+            img.naturalHeight
+          );
+
+          const safeName = title
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "-")
+            .replace(/^-|-$/g, "");
+
+          const link = document.createElement("a");
+          link.download = (safeName || "qr-code") + "-qr.png";
+          link.href = canvas.toDataURL("image/png");
+          link.click();
+        }
     </script>
     `
   );
@@ -1056,6 +1528,7 @@ function handleMultipart(req, res) {
 
       writeDb(db);
       auditLog(req, "file_replace", { fileId: file.id, storedName: file.storedName });
+      await pushUploadToDrive(req, "file_replace", file.storedName);
 
       return res.send(renderFileDetailPage(req, file, getHost(req), "File replaced successfully."));
     }
@@ -1091,6 +1564,7 @@ function handleMultipart(req, res) {
     db.files.push(fileRecord);
     writeDb(db);
     auditLog(req, "file_upload", { fileId: fileRecord.id, storedName: fileRecord.storedName, title, category });
+    await pushUploadToDrive(req, "file_upload", fileRecord.storedName);
 
     return res.send(
       await renderAdminPage(req, "Upload successful.", {
@@ -1133,8 +1607,15 @@ async function handleAdminFormPost(req, res) {
 
         req.session.isAdmin = true;
         req.session.username = username;
-        auditLog(req, "login_success", { username });
-        return res.redirect("/admin");
+
+        req.session.save(function (saveErr) {
+          if (saveErr) {
+            console.error("Session save failed:", saveErr.message);
+            return res.status(500).send(renderLoginPage(req, "Something went wrong. Try again."));
+          }
+          auditLog(req, "login_success", { username });
+          return res.redirect("/admin");
+        });
       });
     });
   }
@@ -1253,6 +1734,7 @@ async function handleAdminFormPost(req, res) {
     file.updatedAt = new Date().toISOString();
     writeDb(db);
     auditLog(req, "file_edit", { fileId: file.id, before, after: { title: newTitle, category: newCategory } });
+    // Edit only changes metadata in db.json — no file push needed.
 
     return res.send(renderFileDetailPage(req, file, getHost(req), "Saved."));
   }
@@ -1275,6 +1757,7 @@ async function handleAdminFormPost(req, res) {
     db.files = db.files.filter(f => f.id !== file.id);
     writeDb(db);
     auditLog(req, "file_delete", { fileId: file.id, storedName: file.storedName, title: file.title });
+    await deleteFromDrive(req, file.storedName);
 
     return res.redirect("/admin");
   }
@@ -1314,7 +1797,46 @@ app.get("/files/:filename", function (req, res) {
   return res.download(filePath, filename);
 });
 
-app.get("*", (req, res) => {
+
+app.get("/admin/backup.zip", function (req, res) {
+  if (!req.session.isAdmin) {
+    return res.status(401).send(renderLoginPage(req, "Log in first."));
+  }
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const downloadName = `backup_${timestamp}.zip`;
+
+  res.setHeader("Content-Type", "application/zip");
+  res.setHeader("Content-Disposition", `attachment; filename="${downloadName}"`);
+
+  const archive = archiver("zip", { zlib: { level: 9 } });
+
+  archive.on("warning", function (err) {
+    console.error("Zip backup warning:", err.message);
+  });
+
+  archive.on("error", function (err) {
+    console.error("Zip backup failed:", err.message);
+    if (!res.writableEnded) res.end();
+  });
+
+  archive.pipe(res);
+
+  if (fs.existsSync(UPLOAD_DIR)) {
+    archive.directory(UPLOAD_DIR, "uploads");
+  }
+
+  if (fs.existsSync(DB_PATH)) {
+    archive.file(DB_PATH, { name: "db.json" });
+  }
+
+  archive.finalize();
+});
+
+
+
+
+app.get("/*splat", (req, res) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.status(404).send(page("Not Found", "<p>Page not found.</p>"));
 });
@@ -1328,7 +1850,20 @@ app.use(function (err, req, res, next) {
   res.status(500).send(page("Error", "<p>Something went wrong. Please try again.</p><p><a href=\"/admin\">Back to admin</a></p>"));
 });
 
-app.listen(PORT, function () {
-  initDb();
-  console.log(`Server running at http://localhost:${PORT}/admin`);
-});
+// Initialise the database synchronously, then restore from Drive (async),
+// then start listening. This ensures the filesystem is warm before the
+// first request arrives.
+initDb();
+
+restoreFromDrive()
+  .catch(err => console.error("Drive restore error:", err.message))
+  .finally(() => {
+    app.listen(PORT, function () {
+      console.log(`Server running at http://localhost:${PORT}/admin`);
+      console.log(
+        DRIVE_BACKUP_ENABLED
+          ? "Google Drive: ENABLED (boot-restore + upload/delete sync)"
+          : "Google Drive: disabled (set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN to enable)"
+      );
+    });
+  });
