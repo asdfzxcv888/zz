@@ -1339,7 +1339,15 @@ async function renderAdminPage(req, message = "", result = null, isError = false
 
     <div class="topbar" style="padding-bottom:0;">
       <h2>Existing Files</h2>
-      <span class="search-count" id="fileCount"></span>
+      <div style="display:flex;align-items:center;gap:0.75rem;">
+        <span class="search-count" id="fileCount"></span>
+        ${db.files.length > 0 ? `
+        <form method="POST" action="/admin" onsubmit="return confirm('Delete ALL ${db.files.length} file(s)? This cannot be undone.');">
+          ${csrfField(req)}
+          <input type="hidden" name="action" value="delete_all">
+          <button type="submit" style="background:#dc2626;">Delete All Files</button>
+        </form>` : ""}
+      </div>
     </div>
 
     <div class="search-bar">
@@ -1462,8 +1470,18 @@ app.get("/admin", async function (req, res) {
   if (!req.session.isAdmin) {
     return res.send(renderLoginPage(req));
   }
+
+  // Consume the one-shot upload flash set by the POST handler.
+  const flash = req.session.flash || null;
+  if (flash) {
+    delete req.session.flash;
+    req.session.save(function (err) {
+      if (err) console.error("Flash clear failed:", err.message);
+    });
+  }
+
   res.setHeader("X-Content-Type-Options", "nosniff");
-  return res.send(await renderAdminPage(req));
+  return res.send(await renderAdminPage(req, flash ? "Upload successful." : "", flash));
 });
 
 app.get("/admin/file/:id", function (req, res) {
@@ -1566,13 +1584,13 @@ function handleMultipart(req, res) {
     auditLog(req, "file_upload", { fileId: fileRecord.id, storedName: fileRecord.storedName, title, category });
     await pushUploadToDrive(req, "file_upload", fileRecord.storedName);
 
-    return res.send(
-      await renderAdminPage(req, "Upload successful.", {
-        storedName: req.file.filename,
-        fileUrl,
-        qrDataUrl
-      })
-    );
+    // PRG — store result in session flash then redirect so a page refresh
+    // hits GET /admin instead of replaying the POST and re-uploading.
+    req.session.flash = { storedName: req.file.filename, fileUrl, qrDataUrl };
+    return req.session.save(function (err) {
+      if (err) console.error("Flash save failed:", err.message);
+      return res.redirect("/admin");
+    });
   });
 }
 
@@ -1762,6 +1780,40 @@ async function handleAdminFormPost(req, res) {
     return res.redirect("/admin");
   }
 
+  if (action === "delete_all") {
+    if (!req.session.isAdmin) {
+      return res.status(401).send(renderLoginPage(req, "Log in first."));
+    }
+
+    const files = db.files.slice();
+
+    // Delete every file from local disk.
+    for (const file of files) {
+      const filePath = path.resolve(UPLOAD_DIR, file.storedName);
+      if (filePath.startsWith(path.resolve(UPLOAD_DIR)) && fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    }
+
+    db.files = [];
+    writeDb(db);
+    auditLog(req, "delete_all_files", { count: files.length });
+
+    // Remove each file from Drive, then db.json is pushed by the last deleteFromDrive call.
+    if (DRIVE_BACKUP_ENABLED) {
+      try {
+        for (const file of files) {
+          await deleteFromDrive(req, file.storedName);
+        }
+      } catch (err) {
+        console.error("Drive delete_all failed:", err.message);
+      }
+    }
+
+    return res.redirect("/admin");
+  }
+
+  // Fallback
   return res.redirect("/admin");
 }
 
